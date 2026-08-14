@@ -13,6 +13,8 @@
  *     GND → GND
  *
  *   WiFi: "ClaWD-Mochi"  pw: clawd1234  → http://192.168.4.1
+ *   (or set STA_SSID/STA_PASS below to join your home WiFi instead
+ *    → http://clawdmochi.local)
  * ╚══════════════════════════════════════════════════════════════╝
  */
 
@@ -22,6 +24,9 @@
 #include <math.h>
 #include <WiFi.h>
 #include <WebServer.h>
+#include <ESPmDNS.h>
+#include <Update.h>
+#include <time.h>
 
 // ── Pins ──────────────────────────────────────────────────────
 #define TFT_CS  4
@@ -34,6 +39,14 @@ Adafruit_ST7789 tft = Adafruit_ST7789(TFT_CS, TFT_DC, TFT_RST);
 // ── WiFi ──────────────────────────────────────────────────────
 const char* AP_SSID = "ClaWD-Mochi";
 const char* AP_PASS = "clawd1234";
+
+// Fill these in to join your home WiFi instead of hosting a hotspot —
+// no more switching your phone's WiFi to reach Mochi. Leave STA_SSID
+// empty ("") to keep the classic hotspot-only behaviour.
+const char* STA_SSID = "";       // Fill locally; keep empty for hotspot mode.
+const char* STA_PASS = "";       // Never commit your Wi-Fi password.
+#define STA_TIMEOUT_MS 15000
+
 WebServer server(80);
 
 // ── Display ───────────────────────────────────────────────────
@@ -65,6 +78,25 @@ uint8_t  animSpeed    = 1;   // 1=slow(default) 2=normal 3=fast
 
 uint16_t animBgColor  = 0;   // background for eye/logo animations
 uint16_t drawBgColor  = 0;   // background for canvas
+
+bool     uiStarted    = false;  // false until first view draw (keeps boot info screen)
+uint32_t nextIdleAt   = 0;      // next random blink/glance
+bool     staUp        = false;  // STA currently connected
+uint32_t nextWifiTick = 0;      // next reconnect check
+uint32_t wifiDownAt   = 0;      // when the connection was first seen down
+bool     breathing    = false;  // backlight pulse = "unread notification"
+bool     sleeping     = false;  // PC locked — eyes closed, slow dim breathing
+uint8_t  faceIdx      = 0;      // which of the FACE_COUNT faces is showing
+uint32_t nextFaceAt   = 0;      // next random face rotation
+
+#define FACE_COUNT      10
+#define FACE_MIN_MS  120000     // rotate every 2–6 min
+#define FACE_RND_MS  240000
+
+// ponytail: night hours hardcoded 00:00–08:00, tz Central (US)
+#define TZ_STRING   "CST6CDT,M3.2.0,M11.1.0"
+#define NIGHT_UNTIL 8
+#define NIGHT_DUTY  25
 
 // ── Terminal ──────────────────────────────────────────────────
 #define TERM_COLS      15
@@ -203,9 +235,25 @@ uint16_t hexToRgb565(String hex) {
   return tft.color565((v >> 16) & 0xFF, (v >> 8) & 0xFF, v & 0xFF);
 }
 
-void setBacklight(bool on) {
-  backlightOn = on;
-  digitalWrite(TFT_BLK, on ? HIGH : LOW);
+void setBacklight(bool on) { backlightOn = on; }  // blTick applies the duty
+
+// Single owner of the backlight PWM: off / breathing pulse / night-dim / full.
+void blTick() {
+  static uint8_t lastDuty = 1;   // impossible initial so first call always writes
+  uint8_t duty;
+  if (!backlightOn) {
+    duty = 0;
+  } else if (sleeping) {
+    duty = 14 + (int8_t)(10.0f * sinf(millis() / 1500.0f));  // slow, faint — asleep
+  } else if (breathing) {
+    duty = 130 + (int8_t)(110.0f * sinf(millis() / 500.0f));
+  } else {
+    duty = 255;
+    struct tm t;
+    if (getLocalTime(&t, 0) && t.tm_year > 120 && t.tm_hour < NIGHT_UNTIL)
+      duty = NIGHT_DUTY;         // it stays up with you, but dims at night
+  }
+  if (duty != lastDuty) { ledcWrite(TFT_BLK, duty); lastDuty = duty; }
 }
 
 void initColours() {
@@ -249,6 +297,7 @@ inline int16_t eyeY()            { return (DISP_H - EYE_H) / 2 - EYE_OY; }
 inline int16_t eyeCY()           { return eyeY() + EYE_H / 2; }
 
 void drawNormalEyes(int16_t ox = 0, bool blink = false) {
+  uiStarted = true;
   tft.fillScreen(animBgColor);
   const int16_t lx = eyeLX(ox), rx = eyeRX(ox), ey = eyeY();
   if (!blink) {
@@ -274,6 +323,7 @@ void drawChevron(int16_t cx, int16_t cy, int16_t arm, int16_t reach,
 }
 
 void drawSquishEyes(bool closed = false) {
+  uiStarted = true;
   tft.fillScreen(animBgColor);
   const int16_t lx = eyeLX(0), rx = eyeRX(0), cy = eyeCY();
   const int16_t arm   = EYE_H / 2;
@@ -286,6 +336,103 @@ void drawSquishEyes(bool closed = false) {
   } else {
     tft.fillRect(lx, cy - 5, EYE_W, 10, C_BLACK);
     tft.fillRect(rx, cy - 5, EYE_W, 10, C_BLACK);
+  }
+}
+
+// ── Extra faces (2–9) — all drawn at the standard eye positions ──
+void drawFaceSleepy() {          // 2: half-lidded
+  uiStarted = true;
+  tft.fillScreen(animBgColor);
+  tft.fillRect(eyeLX(0), eyeY() + EYE_H / 2, EYE_W, EYE_H / 2, C_BLACK);
+  tft.fillRect(eyeRX(0), eyeY() + EYE_H / 2, EYE_W, EYE_H / 2, C_BLACK);
+}
+
+void drawFaceWide() {            // 3: surprised round eyes with a glint
+  uiStarted = true;
+  tft.fillScreen(animBgColor);
+  const int16_t cy = eyeCY();
+  for (int8_t s = 0; s < 2; s++) {
+    const int16_t cx = (s ? eyeRX(0) : eyeLX(0)) + EYE_W / 2;
+    tft.fillCircle(cx, cy, EYE_W, C_BLACK);
+    tft.fillCircle(cx + 9, cy - 9, 6, C_WHITE);
+  }
+}
+
+void drawFaceWink() {            // 4: left open, right closed
+  uiStarted = true;
+  tft.fillScreen(animBgColor);
+  tft.fillRect(eyeLX(0), eyeY(), EYE_W, EYE_H, C_BLACK);
+  tft.fillRect(eyeRX(0), eyeCY() - 4, EYE_W, 8, C_BLACK);
+}
+
+void drawHeart(int16_t cx, int16_t cy, int16_t s, uint16_t col) {
+  tft.fillCircle(cx - s / 2, cy - s / 3, s / 2 + 2, col);
+  tft.fillCircle(cx + s / 2, cy - s / 3, s / 2 + 2, col);
+  tft.fillTriangle(cx - s - 1, cy - s / 6, cx + s + 1, cy - s / 6, cx, cy + s, col);
+}
+
+void drawFaceHearts() {          // 5: heart eyes
+  uiStarted = true;
+  tft.fillScreen(animBgColor);
+  const uint16_t red = tft.color565(235, 30, 60);
+  drawHeart(eyeLX(0) + EYE_W / 2, eyeCY(), 20, red);
+  drawHeart(eyeRX(0) + EYE_W / 2, eyeCY(), 20, red);
+}
+
+void drawFaceDizzy() {           // 6: X X eyes
+  uiStarted = true;
+  tft.fillScreen(animBgColor);
+  for (int8_t s = 0; s < 2; s++) {
+    const int16_t x = s ? eyeRX(0) : eyeLX(0), y = eyeCY() - EYE_W / 2;
+    for (int8_t t = -3; t <= 3; t++) {
+      tft.drawLine(x + t, y, x + EYE_W + t, y + EYE_W, C_BLACK);
+      tft.drawLine(x + EYE_W + t, y, x + t, y + EYE_W, C_BLACK);
+    }
+  }
+}
+
+void drawFaceAngry() {           // 7: slanted inner brows over rect eyes
+  uiStarted = true;
+  tft.fillScreen(animBgColor);
+  const int16_t lx = eyeLX(0), rx = eyeRX(0), ey = eyeY();
+  tft.fillRect(lx, ey, EYE_W, EYE_H, C_BLACK);
+  tft.fillRect(rx, ey, EYE_W, EYE_H, C_BLACK);
+  tft.fillTriangle(lx, ey, lx + EYE_W, ey, lx + EYE_W, ey + 20, animBgColor);  // inner = right
+  tft.fillTriangle(rx, ey + 20, rx, ey, rx + EYE_W, ey, animBgColor);          // inner = left
+}
+
+void drawFaceSus() {             // 8: narrow side-eye squint
+  uiStarted = true;
+  tft.fillScreen(animBgColor);
+  tft.fillRect(eyeLX(10), eyeCY() - 9, EYE_W, 18, C_BLACK);
+  tft.fillRect(eyeRX(10), eyeCY() - 9, EYE_W, 18, C_BLACK);
+}
+
+void drawFaceContent() {         // 9: happy closed arcs (∩ ∩)
+  uiStarted = true;
+  tft.fillScreen(animBgColor);
+  const int16_t cy = eyeCY();
+  for (int8_t s = 0; s < 2; s++) {
+    const int16_t cx = (s ? eyeRX(0) : eyeLX(0)) + EYE_W / 2;
+    tft.fillCircle(cx, cy, EYE_W / 2 + 6, C_BLACK);
+    tft.fillCircle(cx, cy, EYE_W / 2 - 3, animBgColor);
+    tft.fillRect(cx - EYE_W / 2 - 7, cy, EYE_W + 14, EYE_W / 2 + 8, animBgColor);
+  }
+}
+
+void drawFace(uint8_t i) {
+  switch (i) {
+    default:
+    case 0: drawNormalEyes();   break;
+    case 1: drawSquishEyes();   break;
+    case 2: drawFaceSleepy();   break;
+    case 3: drawFaceWide();     break;
+    case 4: drawFaceWink();     break;
+    case 5: drawFaceHearts();   break;
+    case 6: drawFaceDizzy();    break;
+    case 7: drawFaceAngry();    break;
+    case 8: drawFaceSus();      break;
+    case 9: drawFaceContent();  break;
   }
 }
 
@@ -448,6 +595,79 @@ void animLogoReveal() {
   drawLogoFilled(animBgColor, C_WHITE);
   delay(1500);
   busy = false;
+}
+
+// ── Idle life — random blinks, glances & face rotation ─────────
+void idleTick() {
+  if (!uiStarted || busy || termMode || sleeping) return;
+  if (currentView != VIEW_EYES_NORMAL && currentView != VIEW_EYES_SQUISH) return;
+  if (millis() < nextIdleAt) return;
+
+  // every few minutes: swap to a random face
+  if (nextFaceAt == 0) nextFaceAt = millis() + FACE_MIN_MS + random(FACE_RND_MS);
+  if (millis() > nextFaceAt) {
+    faceIdx = random(FACE_COUNT);
+    busy = true; drawFace(faceIdx); busy = false;
+    nextFaceAt = millis() + FACE_MIN_MS + random(FACE_RND_MS);
+    nextIdleAt = millis() + 2500 + random(4500);
+    return;
+  }
+
+  busy = true;
+  if (faceIdx == 0) {
+    if (random(4) == 0) {                       // 1-in-4: glance to the side
+      drawNormalEyes(random(2) ? 14 : -14);
+      delay(280);
+      drawNormalEyes(0);
+    } else {                                    // otherwise: blink
+      drawNormalEyes(0, true);
+      delay(110);
+      drawNormalEyes(0, false);
+    }
+  } else if (faceIdx == 1) {
+    drawSquishEyes(true);
+    delay(120);
+    drawSquishEyes(false);
+  }                                             // other faces hold still until rotation
+  busy = false;
+  nextIdleAt = millis() + 2500 + random(4500);  // next one in 2.5–7 s
+}
+
+// Static IP so /notify scripts never chase a DHCP lease — must be re-declared
+// on every (re)join or the driver silently falls back to DHCP.
+// ponytail: hardcoded to the Windows-hotspot subnet (gateway .1)
+void staBegin() {
+  WiFi.config(IPAddress(192,168,137,50), IPAddress(192,168,137,1),
+              IPAddress(255,255,255,0), IPAddress(192,168,137,1));
+  WiFi.begin(STA_SSID, STA_PASS);
+}
+
+// ── WiFi self-heal — the PC hotspot comes and goes with sleep ──
+// Reconnects when the hotspot returns; also rescues the boot-time
+// AP-fallback case without needing a USB replug.
+void wifiTick() {
+  if (strlen(STA_SSID) == 0 || millis() < nextWifiTick) return;
+  nextWifiTick = millis() + 10000;
+  if (WiFi.status() == WL_CONNECTED) {
+    wifiDownAt = 0;
+    if (!staUp) {                 // just (re)joined — e.g. recovered from AP fallback
+      staUp = true;
+      WiFi.setSleep(false);
+      MDNS.begin("clawdmochi");
+    }
+    return;
+  }
+  staUp = false;
+  if (wifiDownAt == 0) wifiDownAt = millis();
+  // Asleep with no network for 10+ min: the wake command can never reach us,
+  // so stop looking dead and wake up on our own.
+  if (sleeping && millis() - wifiDownAt > 600000) {
+    sleeping = false;
+    animNormalEyes();
+  }
+  // ponytail: screen keeps whatever it shows during retries; IP is on /state
+  if (WiFi.getMode() == WIFI_AP) WiFi.mode(WIFI_AP_STA);  // keep AP alive as fallback
+  staBegin();
 }
 
 // ═════════════════════════════════════════════════════════════
@@ -896,6 +1116,8 @@ void routeCmd() {
     server.send(400, "application/json", "{\"e\":1}"); return;
   }
   const char c = server.arg("k")[0];
+  breathing = false;   // user interacted — stop the notification pulse
+  sleeping  = false;
 
   if (termMode) {
     if (c == 'q') { termMode = false; drawCodeView(); }
@@ -904,8 +1126,8 @@ void routeCmd() {
 
   server.send(200, "application/json", "{\"ok\":1}");
   switch (c) {
-    case 'w': currentView = VIEW_EYES_NORMAL; animNormalEyes(); break;
-    case 's': currentView = VIEW_EYES_SQUISH; animSquishEyes(); break;
+    case 'w': currentView = VIEW_EYES_NORMAL; faceIdx = 0; animNormalEyes(); break;
+    case 's': currentView = VIEW_EYES_SQUISH; faceIdx = 1; animSquishEyes(); break;
     case 'd':
       currentView = VIEW_CODE; drawCodeView();
       termMode = true; termClear(); termFullRedraw(); break;
@@ -928,18 +1150,22 @@ void routeSpeed() {
   server.send(200, "application/json", "{\"ok\":1}");
 }
 
-// /redraw?bg=hex — set animBg and immediately redraw current view
-void routeRedraw() {
-  if (server.hasArg("bg")) {
-    animBgColor = hexToRgb565(server.arg("bg"));
-    drawBgColor = animBgColor;
-  }
+void drawCurrentView() {
   switch (currentView) {
     case VIEW_EYES_NORMAL: drawNormalEyes(); break;
     case VIEW_EYES_SQUISH: drawSquishEyes(); break;
     case VIEW_CODE:        drawCodeView();   break;
     case VIEW_DRAW:        tft.fillScreen(drawBgColor); break;
   }
+}
+
+// /redraw?bg=hex — set animBg and immediately redraw current view
+void routeRedraw() {
+  if (server.hasArg("bg")) {
+    animBgColor = hexToRgb565(server.arg("bg"));
+    drawBgColor = animBgColor;
+  }
+  drawCurrentView();
   server.send(200, "application/json", "{\"ok\":1}");
 }
 
@@ -996,6 +1222,70 @@ void routeBacklight() {
   server.send(200, "application/json", "{\"ok\":1}");
 }
 
+// /notify — for bots/scripts (trading bot, Claude Code hooks):
+//   view=w|s|d   switch face (normal / squish / code view)
+//   msg=...      open the terminal and type the message out
+//   alert=good|bad  flash the whole screen green/red 3× (visible from afar)
+//   breathe=1|0  pulse the backlight until the next interaction
+//   sleep=1|0    PC locked/unlocked — close eyes & dim, or wake back up
+//   face=0..9    jump straight to a specific face
+//   bg=RRGGBB    optional background colour, hex without '#'
+void routeNotify() {
+  if (server.hasArg("bg")) {
+    animBgColor = hexToRgb565(server.arg("bg"));
+    drawBgColor = animBgColor;
+  }
+  const String v     = server.arg("view");
+  const String msg   = server.arg("msg");
+  const String alert = server.arg("alert");
+  if (server.hasArg("breathe")) breathing = server.arg("breathe") == "1";
+  server.send(200, "application/json", "{\"ok\":1}");
+  if (server.hasArg("sleep")) {
+    const bool toSleep = server.arg("sleep") == "1";
+    if (toSleep && !sleeping) {
+      sleeping = true; breathing = false; termMode = false;
+      currentView = VIEW_EYES_NORMAL;
+      drawNormalEyes(0, true);           // eyes shut
+    } else if (!toSleep && sleeping) {
+      sleeping = false;
+      animNormalEyes();                  // wake-up wiggle & blink
+    }
+    return;
+  }
+  if (server.hasArg("face")) {
+    breathing = false; sleeping = false; termMode = false;
+    faceIdx = constrain(server.arg("face").toInt(), 0, FACE_COUNT - 1);
+    currentView = (faceIdx == 1) ? VIEW_EYES_SQUISH : VIEW_EYES_NORMAL;
+    drawFace(faceIdx);
+    return;
+  }
+  if (alert.length() > 0 || v.length() > 0 || msg.length() > 0) {
+    breathing = false;   // a fresh event supersedes the standby pulse
+    sleeping  = false;
+  }
+  if (alert.length() > 0) {
+    busy = true;
+    const uint16_t col = (alert == "bad") ? tft.color565(230, 30, 30)
+                                          : tft.color565(30, 210, 90);
+    for (uint8_t i = 0; i < 3; i++) {
+      tft.fillScreen(col);     delay(170);
+      tft.fillScreen(C_BLACK); delay(110);
+    }
+    busy = false;
+    drawCurrentView();
+  } else if (msg.length() > 0) {
+    currentView = VIEW_CODE;
+    termMode = true; termClear(); termFullRedraw();
+    for (unsigned int i = 0; i < msg.length(); i++) termAddChar(msg[i]);
+  } else if (v.length() > 0) {
+    switch (v[0]) {
+      case 'w': termMode = false; currentView = VIEW_EYES_NORMAL; faceIdx = 0; animNormalEyes(); break;
+      case 's': termMode = false; currentView = VIEW_EYES_SQUISH; faceIdx = 1; animSquishEyes(); break;
+      case 'd': termMode = false; currentView = VIEW_CODE; drawCodeView(); break;
+    }
+  }
+}
+
 // Convert RGB565 back to #RRGGBB for state endpoint
 String rgb565ToHex(uint16_t c) {
   uint8_t r = ((c >> 11) & 0x1F) << 3;
@@ -1018,6 +1308,28 @@ void routeState() {
 
 void routeNotFound() { server.send(404, "text/plain", "not found"); }
 
+// POST /update with the .bin as a multipart file — the browser/curl pushes to
+// us, so there's no call-back-to-host leg for a firewall to block and no
+// custom protocol to time out. espota's job, done over plain HTTP:
+//   curl -F "f=@clawd_mochi.ino.bin" http://clawdmochi.local/update
+void routeUpdateUpload() {
+  HTTPUpload& up = server.upload();
+  if (up.status == UPLOAD_FILE_START) {
+    setBacklight(true);
+    tft.fillScreen(C_DARKBG);
+    tft.setTextColor(C_ORANGE); tft.setTextSize(2);
+    tft.setCursor(12, 100); tft.print("updating...");
+    Update.begin(UPDATE_SIZE_UNKNOWN);
+  } else if (up.status == UPLOAD_FILE_WRITE) {
+    Update.write(up.buf, up.currentSize);
+  } else if (up.status == UPLOAD_FILE_END) {
+    if (!Update.end(true)) drawCurrentView();   // failed — don't strand the screen
+  } else if (up.status == UPLOAD_FILE_ABORTED) {
+    Update.abort();                             // else a dead upload blocks all retries
+    drawCurrentView();
+  }
+}
+
 // ═════════════════════════════════════════════════════════════
 //  SETUP
 // ═════════════════════════════════════════════════════════════
@@ -1025,7 +1337,8 @@ void routeNotFound() { server.send(404, "text/plain", "not found"); }
 void setup() {
   Serial.begin(115200);
 
-  pinMode(TFT_BLK, OUTPUT);
+  ledcAttach(TFT_BLK, 5000, 8);   // PWM so the backlight can breathe/dim
+  ledcWrite(TFT_BLK, 255);
   setBacklight(true);
 
   SPI.begin(8, -1, 10, TFT_CS);   // SCK=8, MOSI=10
@@ -1045,22 +1358,59 @@ void setup() {
   animLogoReveal();
 
   // ── Start WiFi ─────────────────────────────────────────────
-  WiFi.mode(WIFI_AP);
-  WiFi.softAP(AP_SSID, AP_PASS);
+  // Try joining home WiFi (STA) first if credentials are set; fall back
+  // to hosting the hotspot (AP) if that's not set or the join times out.
+  bool staConnected = false;
+  if (strlen(STA_SSID) > 0) {
+    WiFi.mode(WIFI_STA);
+    Serial.printf("[STA] connecting to %s\n", STA_SSID);
+    // ESP32-C3 SuperMini antenna quirk: full TX power distorts the signal
+    // and the router never completes the handshake — lower power fixes it.
+    WiFi.setTxPower(WIFI_POWER_8_5dBm);
+    staBegin();
+    uint32_t t0 = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - t0 < STA_TIMEOUT_MS) delay(200);
+    staConnected = WiFi.status() == WL_CONNECTED;
+    // Modem sleep parks the radio between beacons — pings jump to ~200ms and
+    // a sustained OTA transfer drops mid-flight. Keep the radio awake.
+    if (staConnected) WiFi.setSleep(false);
+    Serial.printf("[STA] %s, IP: %s\n", staConnected ? "CONNECTED" : "FAILED — falling back to AP",
+                  WiFi.localIP().toString().c_str());
+  }
+  configTzTime(TZ_STRING, "pool.ntp.org");   // SNTP keeps retrying once network is up
+  if (staConnected) {
+    staUp = true;
+    MDNS.begin("clawdmochi");
+  } else {
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP(AP_SSID, AP_PASS);
+  }
 
   // ── WiFi info screen (stays until first web request) ───────
   tft.fillScreen(C_DARKBG);
   tft.fillRect(0, 0, DISP_W, 4, C_ORANGE);
-  tft.setTextColor(C_WHITE);  tft.setTextSize(2);
-  tft.setCursor(12, 16);  tft.print("WiFi: ClaWD-Mochi");
-  tft.setTextColor(C_MUTED);  tft.setTextSize(1);
-  tft.setCursor(12, 44);  tft.print("password: clawd1234");
-  tft.setTextColor(C_WHITE);  tft.setTextSize(2);
-  tft.setCursor(12, 68);  tft.print("Open browser:");
-  tft.setTextColor(C_ORANGE); tft.setTextSize(2);
-  tft.setCursor(12, 94);  tft.print("192.168.4.1");
-  tft.setTextColor(C_MUTED);  tft.setTextSize(1);
-  tft.setCursor(12, 124); tft.print("press any button to start");
+  if (staConnected) {
+    tft.setTextColor(C_WHITE);  tft.setTextSize(2);
+    tft.setCursor(12, 16);  tft.print("WiFi: ");   tft.print(STA_SSID);
+    tft.setTextColor(C_WHITE);  tft.setTextSize(2);
+    tft.setCursor(12, 68);  tft.print("Open browser:");
+    tft.setTextColor(C_ORANGE); tft.setTextSize(2);
+    tft.setCursor(12, 94);  tft.print("clawdmochi.local");
+    tft.setTextColor(C_MUTED);  tft.setTextSize(1);
+    tft.setCursor(12, 118); tft.print("or ");       tft.print(WiFi.localIP());
+    tft.setCursor(12, 132); tft.print("press any button to start");
+  } else {
+    tft.setTextColor(C_WHITE);  tft.setTextSize(2);
+    tft.setCursor(12, 16);  tft.print("WiFi: ClaWD-Mochi");
+    tft.setTextColor(C_MUTED);  tft.setTextSize(1);
+    tft.setCursor(12, 44);  tft.print("password: clawd1234");
+    tft.setTextColor(C_WHITE);  tft.setTextSize(2);
+    tft.setCursor(12, 68);  tft.print("Open browser:");
+    tft.setTextColor(C_ORANGE); tft.setTextSize(2);
+    tft.setCursor(12, 94);  tft.print("192.168.4.1");
+    tft.setTextColor(C_MUTED);  tft.setTextSize(1);
+    tft.setCursor(12, 124); tft.print("press any button to start");
+  }
 
   // ── Register routes ────────────────────────────────────────
   server.on("/",            HTTP_GET, routeRoot);
@@ -1072,7 +1422,13 @@ void setup() {
   server.on("/draw/clear",  HTTP_GET, routeDrawClear);
   server.on("/draw/stroke", HTTP_GET, routeDrawStroke);
   server.on("/backlight",   HTTP_GET, routeBacklight);
+  server.on("/notify",                routeNotify);   // GET or POST
   server.on("/state",       HTTP_GET, routeState);
+  server.on("/update", HTTP_POST, []() {
+    const bool ok = !Update.hasError();
+    server.send(200, "text/plain", ok ? "OK — rebooting" : "FAILED");
+    if (ok) { delay(300); ESP.restart(); }
+  }, routeUpdateUpload);
   server.onNotFound(routeNotFound);
   server.begin();
 
@@ -1084,4 +1440,9 @@ void setup() {
 //  LOOP
 // ═════════════════════════════════════════════════════════════
 
-void loop() { server.handleClient(); }
+void loop() {
+  server.handleClient();
+  idleTick();
+  wifiTick();
+  blTick();
+}

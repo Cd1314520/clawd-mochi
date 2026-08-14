@@ -123,6 +123,8 @@ Go to **Tools** and set:
 4. Connect to the network: **`ClaWD-Mochi`** · password: **`clawd1234`**
 5. Open a browser and go to **`http://192.168.4.1`**
 
+> **Tip:** don't want to switch your phone's WiFi every time? Set `STA_SSID`/`STA_PASS` near the top of `clawd_mochi.ino` to your home WiFi — Mochi joins your network instead of hosting its own, and you reach it at `http://clawdmochi.local` from any device already on that WiFi. Leave them blank to keep the hotspot behaviour above.
+
 You should see the web controller:
 
 <img src="pics/clawd_mochi_webpage.jpeg" alt="Webpage view" width="500"/>

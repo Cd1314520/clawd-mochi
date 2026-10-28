@@ -1,0 +1,7 @@
+<?xml version="1.0"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo><Description>Clawd Mochi: wake up when workstation unlocks</Description></RegistrationInfo>
+  <Triggers><SessionStateChangeTrigger><Enabled>true</Enabled><StateChange>SessionUnlock</StateChange></SessionStateChangeTrigger></Triggers>
+  <Settings><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries><StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><ExecutionTimeLimit>PT1M</ExecutionTimeLimit><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy></Settings>
+  <Actions Context="Author"><Exec><Command>wscript.exe</Command><Arguments>"%LOCALAPPDATA%\ClawdMochi\mochi_unlock.vbs"</Arguments></Exec></Actions>
+</Task>

@@ -1,35 +1,30 @@
-# Clawd Mochi — Chris 定制版 v0.2.0
+# v0.2.0: Connected Desk Pet
 
-> **版本代号：Connected Desk Pet**
+Chris Dong's fork of [yousifamanuel/clawd-mochi](https://github.com/yousifamanuel/clawd-mochi), based on upstream `main` at
+commit `0a8e9f6` (2026-06-28). Everything below is added on top of upstream. Hardware, wiring, original firmware, case and photos are upstream's.
 
-这份固件基于上游项目 `yousifamanuel/clawd-mochi` 的 `main` 分支提交
-`0a8e9f6`（2026-06-28）。本地定制固件位于
-[`clawd_mochi/clawd_mochi.ino`](clawd_mochi/clawd_mochi.ino)。
+## Firmware (`clawd_mochi/clawd_mochi.ino`, still one file)
 
-## 已加入的功能
+- **STA mode:** joins your Wi-Fi when `STA_SSID` is set; after 15 s without a connection it falls back to the classic `ClaWD-Mochi` hotspot.
+- **Static IP** `192.168.137.50` (Windows mobile hotspot subnet), re-applied on every reconnect. mDNS name `clawdmochi.local`.
+- **Self-healing Wi-Fi:** checks every 10 s and rejoins after the network drops.
+- **ESP32-C3 SuperMini fixes:** `WiFi.setTxPower(WIFI_POWER_8_5dBm)` (antenna quirk) and `WiFi.setSleep(false)` (modem sleep broke uploads).
+- **`/notify` API:** `view`, `msg`, `alert=good|bad`, `breathe`, `sleep`, `face`, `bg`. See [docs/api.md](docs/api.md).
+- **`/update`:** firmware upload over plain HTTP. Replaces ArduinoOTA/espota, which Windows Firewall blocked.
+- **Backlight on PWM:** breathing pulse, faint sleep pulse, night dimming 00:00–08:00 (NTP, US Central).
+- **Life:** 10 faces rotating every 2–6 min, random blinks and glances.
+- **Sleep sync:** `sleep=1|0`; wakes itself after 10 min asleep with no network.
 
-- STA Wi-Fi 模式：Mochi 可加入本地网络，不必让手机切换到它自己的热点。
-- 固定 IP、自动重连与断网恢复。
-- `/notify` HTTP 接口：脚本或 Claude Code 可让 Mochi 换脸、显示消息、闪绿/红警报或呼吸提醒。
-- 浏览器 HTTP 无线更新：使用 `/update` 推送新的固件，不依赖 Arduino IDE 的网络端口。
-- 电脑锁屏时睡觉、解锁时醒来；睡眠断网过久会自动醒来，避免卡在黑屏状态。
-- 自动眨眼、瞟眼、夜间调暗背光。
-- 十张随机轮换的表情脸。
-- Claude Code 状态联动：完成时开心、失败时红色警报、等待输入时呼吸提醒。
+## PC side (`tools/`, Windows 11)
 
-## 发布到 GitHub 前必须做的事
+- Claude Code hooks example: squint on done, red flash on tool failure, breathing while waiting.
+- Lock/unlock → sleep/wake: two VBScripts + two Task Scheduler XMLs.
+- `mochi_watchdog.py`: restarts the Windows mobile hotspot when Mochi goes unreachable.
 
-**不要直接发布当前固件。** `clawd_mochi.ino` 中的 `STA_SSID` 与
-`STA_PASS` 目前是本机网络凭据，发布前必须替换为：
+## Case (`models/clawd_mochi/`)
 
-```cpp
-const char* STA_SSID = "";
-const char* STA_PASS = "";
-```
+- `clawd_mochi_v1_holes_2.2mm.stl` / `.step`: screw holes widened 1.6 → 2.2 mm, rebuilt by `enlarge_screw_holes.py`. CC BY-NC-SA 4.0, derived from Yousuf Amanuel's design.
 
-用户可自行填写 Wi-Fi 名称和密码；留空时，Mochi 保持原版热点模式。
+## Docs
 
-## 推荐发布方式
-
-先作为个人 Fork 发布，版本名使用 **v0.2.0 — Connected Desk Pet**。
-其中通用的部分（STA 模式、通知接口、HTTP 更新等）可以后续整理成独立 PR 回馈给上游项目。
+- README rewritten as a beginner tutorial; `docs/` for API, troubleshooting, Claude Code, Windows automation, case & assembly.

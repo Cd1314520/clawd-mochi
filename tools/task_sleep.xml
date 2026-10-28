@@ -1,0 +1,7 @@
+<?xml version="1.0"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo><Description>Clawd Mochi: close eyes when workstation locks</Description></RegistrationInfo>
+  <Triggers><SessionStateChangeTrigger><Enabled>true</Enabled><StateChange>SessionLock</StateChange></SessionStateChangeTrigger></Triggers>
+  <Settings><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries><StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><ExecutionTimeLimit>PT1M</ExecutionTimeLimit><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy></Settings>
+  <Actions Context="Author"><Exec><Command>wscript.exe</Command><Arguments>"%LOCALAPPDATA%\ClawdMochi\mochi_lock.vbs"</Arguments></Exec></Actions>
+</Task>
